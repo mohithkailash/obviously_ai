@@ -1,97 +1,128 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from typing import List, Optional
-from datetime import datetime
 from ..database import get_db
 from ..models.book import Book
-from ..schemas.book import BookCreate, Book as BookSchema, BookUpdate
+from ..schemas.book import BookCreate, BookUpdate, Book as BookSchema
 from ..auth import get_current_user
-from sse_starlette.sse import EventSourceResponse
-import asyncio
-import json
+from ..exceptions.exception_types import (
+    NotFoundError, 
+    DuplicateBookError,
+    BookAPIException
+)
 
 router = APIRouter()
 
-@router.post("/books/", response_model=BookSchema)
-def create_book(
+@router.post("/", response_model=BookSchema)
+async def create_book(
     book: BookCreate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
+    if db.query(Book).filter(Book.title == book.title).first():
+        raise DuplicateBookError(book.title)
+    
     db_book = Book(**book.dict())
-    db.add(db_book)
-    db.commit()
-    db.refresh(db_book)
-    return db_book
+    try:
+        db.add(db_book)
+        db.commit()
+        db.refresh(db_book)
+        return db_book
+    except IntegrityError:
+        db.rollback()
+        raise DuplicateBookError(book.title)
+    except SQLAlchemyError:
+        db.rollback()
+        raise BookAPIException(
+            status_code=500,
+            detail="Database error while creating book"
+        )
 
-@router.get("/books/", response_model=List[BookSchema])
-def read_books(
-    skip: int = 0,
-    limit: int = 10,
+@router.get("/", response_model=List[BookSchema])
+async def read_books(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    books = db.query(Book).offset(skip).limit(limit).all()
-    return books
+    try:
+        books = db.query(Book).offset(skip).limit(limit).all()
+        return books
+    except SQLAlchemyError:
+        raise BookAPIException(
+            status_code=500,
+            detail="Database error while fetching books"
+        )
 
-@router.get("/books/{book_id}", response_model=BookSchema)
-def read_book(
+@router.get("/{book_id}", response_model=BookSchema)
+async def read_book(
     book_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    book = db.query(Book).filter(Book.id == book_id).first()
-    if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-    return book
+    try:
+        book = db.query(Book).filter(Book.id == book_id).first()
+        if not book:
+            raise NotFoundError("Book", book_id)
+        return book
+    except SQLAlchemyError:
+        raise BookAPIException(
+            status_code=500,
+            detail=f"Database error while fetching book {book_id}"
+        )
 
-@router.patch("/books/{book_id}", response_model=BookSchema)
-def update_book(
+@router.patch("/{book_id}", response_model=BookSchema)
+async def update_book(
     book_id: int,
     book_update: BookUpdate,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    db_book = db.query(Book).filter(Book.id == book_id).first()
-    if db_book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-    
-    update_data = book_update.dict(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(db_book, key, value)
-    
-    db.commit()
-    db.refresh(db_book)
-    return db_book
+    try:
+        db_book = db.query(Book).filter(Book.id == book_id).first()
+        if not db_book:
+            raise NotFoundError("Book", book_id)
 
-@router.delete("/books/{book_id}")
-def delete_book(
+        # Check for title uniqueness if title is being updated
+        if book_update.title and book_update.title != db_book.title:
+            if db.query(Book).filter(Book.title == book_update.title).first():
+                raise DuplicateBookError(book_update.title)
+        
+        update_data = book_update.dict(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(db_book, key, value)
+        
+        db.commit()
+        db.refresh(db_book)
+        return db_book
+    except IntegrityError:
+        db.rollback()
+        raise DuplicateBookError(book_update.title)
+    except SQLAlchemyError:
+        db.rollback()
+        raise BookAPIException(
+            status_code=500,
+            detail=f"Database error while updating book {book_id}"
+        )
+
+@router.delete("/{book_id}")
+async def delete_book(
     book_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    book = db.query(Book).filter(Book.id == book_id).first()
-    if book is None:
-        raise HTTPException(status_code=404, detail="Book not found")
-    db.delete(book)
-    db.commit()
-    return {"message": "Book deleted successfully"}
-
-# Bonus: SSE endpoint for real-time updates
-@router.get("/books/stream/updates")
-async def stream_updates(
-    request: Request,
-    current_user: dict = Depends(get_current_user)
-):
-    async def event_generator():
-        while True:
-            if await request.is_disconnected():
-                break
-
-            # Simulate updates (in a real app, this would come from a message queue or similar)
-            data = {"timestamp": str(datetime.now()), "message": "Book update received"}
-            yield f"data: {json.dumps(data)}\n\n"
-            
-            await asyncio.sleep(5)  # Send update every 5 seconds
-
-    return EventSourceResponse(event_generator())
+    try:
+        db_book = db.query(Book).filter(Book.id == book_id).first()
+        if not db_book:
+            raise NotFoundError("Book", book_id)
+        
+        db.delete(db_book)
+        db.commit()
+        return {"message": "Book deleted successfully"}
+    except SQLAlchemyError:
+        db.rollback()
+        raise BookAPIException(
+            status_code=500,
+            detail=f"Database error while deleting book {book_id}"
+        )

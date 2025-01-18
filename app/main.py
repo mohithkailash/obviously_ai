@@ -1,51 +1,50 @@
-from fastapi import FastAPI, HTTPException
+# app/main.py
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
 from .routers import auth, books
 from .database import engine, Base
+from .exceptions.handlers import register_exception_handlers
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Books API",
-    description="A FastAPI application for take home assignment",
-    version="1.0.0"
+    description="A FastAPI application for managing books with JWT authentication (obviously.ai take home)",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
-origins = [
-    "http://localhost.tiangolo.com",
-    "https://localhost.tiangolo.com",
-    "http://localhost",
-    "http://localhost:8080",
-]
-
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # For take home only
     allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Error handlers
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()}
-    )
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": str(exc.detail)}
-    )
+# Register exception handlers
+register_exception_handlers(app)
 
 # Include routers
-app.include_router(auth.router, prefix="/api", tags=["authentication"])
-app.include_router(books.router, prefix="/api", tags=["books"])
+app.include_router(
+    auth.router,
+    prefix="/api/auth",
+    tags=["Authentication"]
+)
+
+app.include_router(
+    books.router,
+    prefix="/api/books",
+    tags=["Books"]
+)
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Books API"}
+    return {
+        "message": "Welcome to the Books API",
+        "documentation": "/api/docs",
+        "version": app.version
+    }
